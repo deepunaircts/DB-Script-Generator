@@ -126,6 +126,158 @@ const sqlTypes = {
 };
 
 function App() {
+  // Tab state
+  const [activeTab, setActiveTab] = useState('generator');
+  // Script Validator state
+  const [validatorScript, setValidatorScript] = useState("");
+  const [validationResult, setValidationResult] = useState(null);
+
+  // Handler for script validation
+  const handleValidateScript = () => {
+    const script = validatorScript.trim();
+    if (!script) {
+      setValidationResult({ valid: false, message: "Script area cannot be empty." });
+      return;
+    }
+
+    // 1. Check for unsupported symbols
+    // Allow: letters, numbers, whitespace, (), [], {}, _, ., ,, ;, ', ", =, <, >, !, ?, :, /, *, +, -, @
+    // Disallow: #, ~, `, $, %, ^, &, |, \
+    const unsupportedSymbols = script.match(/[#$%~`^&|\\]/g);
+
+    // 2. Validate datatypes in CREATE TABLE
+    // Gather all supported datatypes from all dbs, lowercase, remove ()
+    const supportedTypes = Array.from(new Set(
+      Object.values(sqlTypes).flat().map(t => t.toLowerCase().replace(/\(.+\)/, ""))
+    ));
+
+    // Find CREATE TABLE blocks
+    const tableMatches = script.match(/CREATE\s+TABLE\s+[^()]+\(([^;]+)\)/i);
+    let datatypeErrors = [];
+    if (tableMatches && tableMatches[1]) {
+      // Split columns by comma, then check datatype and column name
+      const cols = tableMatches[1].split(/,(?![^()]*\))/); // split on commas not inside parentheses
+      // Check for misplaced commas
+      if (/^\s*,|,\s*$/.test(tableMatches[1])) {
+        datatypeErrors.push("Misplaced comma at start or end of column list.");
+      }
+      // Check for missing commas between columns (e.g., two column defs on one line with no comma)
+      for (let i = 0; i < cols.length - 1; i++) {
+        if (!/,\s*$/.test(cols[i] + ',')) {
+          // This check is simplistic; in SQL, columns must be comma-separated
+          // If a line ends without a comma and is not last, it's likely a missing comma
+          // But since we split by commas, this is mostly handled
+        }
+      }
+      cols.forEach(col => {
+        const parts = col.trim().split(/\s+/);
+        // Validate column name
+        if (parts.length >= 2) {
+          const colName = parts[0];
+          // Allowed: letters, numbers, underscores, not starting with digit, no spaces or special chars
+          if (!/^[_a-zA-Z][_a-zA-Z0-9]*$/.test(colName)) {
+            datatypeErrors.push(`Invalid column name: '${colName}'. Only letters, numbers, and underscores allowed, and must not start with a digit.`);
+          }
+          let type = parts[1].toLowerCase();
+          type = type.replace(/\(.+\)/, ""); // remove length/precision
+          if (!supportedTypes.includes(type)) {
+            datatypeErrors.push(`Unsupported datatype: ${parts[1]}`);
+          }
+        }
+      });
+      // Check for consecutive commas (,,)
+      if (/,,/.test(tableMatches[1])) {
+        datatypeErrors.push("Consecutive commas detected in column list.");
+      }
+    }
+
+    // 3. Creation statement validation
+    let creationErrors = [];
+    // CREATE TABLE (match all, multiline, flexible)
+    const tableCreateMatches = [...script.matchAll(/CREATE\s+TABLE\s+([_a-zA-Z][_a-zA-Z0-9]*)\s*\(([\s\S]*?)\)\s*;?/gi)];
+    if (tableCreateMatches.length === 0) {
+      creationErrors.push("Missing or malformed CREATE TABLE statement.");
+    } else {
+      let validTableFound = false;
+      for (const match of tableCreateMatches) {
+        const tableName = match[1];
+        if (/^[_a-zA-Z][_a-zA-Z0-9]*$/.test(tableName)) {
+          validTableFound = true;
+        } else {
+          creationErrors.push(`Invalid table name: '${tableName}'. Only letters, numbers, and underscores allowed, and must not start with a digit.`);
+        }
+        // Also validate columns for each table
+        const columnsBlock = match[2];
+        // Split columns by commas, but allow for the last column to not have a comma or semicolon
+        const cols = columnsBlock.split(/,(?![^()]*\))/).map(c => c.trim()).filter(Boolean);
+        for (const col of cols) {
+          const parts = col.split(/\s+/);
+          if (parts.length >= 2) {
+            const colName = parts[0];
+            if (!/^[_a-zA-Z][_a-zA-Z0-9]*$/.test(colName)) {
+              creationErrors.push(`Invalid column name: '${colName}'. Only letters, numbers, and underscores allowed, and must not start with a digit.`);
+            }
+            let type = parts[1].toLowerCase();
+            // Extract base type (e.g., VARCHAR from VARCHAR(255)), remove trailing parens and whitespace
+            const baseType = type.split('(')[0].replace(/[^a-z0-9_]/gi, '').trim();
+            if (!supportedTypes.includes(baseType)) {
+              creationErrors.push(`Unsupported datatype: ${parts[1]}`);
+            }
+          }
+        }
+      }
+      if (!validTableFound) {
+        creationErrors.push("No valid CREATE TABLE statement found.");
+      }
+    }
+    // CREATE FUNCTION (match all, multiline)
+    const functionCreateMatches = [...script.matchAll(/CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+([_a-zA-Z][_a-zA-Z0-9]*)/gis)];
+    if (functionCreateMatches.length === 0) {
+      // Only warn if missing, do not treat as error
+      // creationErrors.push("Missing or malformed CREATE FUNCTION statement.");
+    } else {
+      let validFunctionFound = false;
+      for (const match of functionCreateMatches) {
+        const functionName = match[2];
+        if (/^[_a-zA-Z][_a-zA-Z0-9]*$/.test(functionName)) {
+          validFunctionFound = true;
+        } else {
+          creationErrors.push(`Invalid function name: '${functionName}'. Only letters, numbers, and underscores allowed, and must not start with a digit.`);
+        }
+      }
+      if (!validFunctionFound) {
+        creationErrors.push("No valid CREATE FUNCTION statement found.");
+      }
+    }
+    // CREATE PROCEDURE (match all, multiline)
+    const procedureCreateMatches = [...script.matchAll(/CREATE\s+(OR\s+REPLACE\s+)?PROCEDURE\s+([_a-zA-Z][_a-zA-Z0-9]*)/gis)];
+    if (procedureCreateMatches.length > 0) {
+      for (const match of procedureCreateMatches) {
+        const procedureName = match[2];
+        if (!/^[_a-zA-Z][_a-zA-Z0-9]*$/.test(procedureName)) {
+          creationErrors.push(`Invalid procedure name: '${procedureName}'. Only letters, numbers, and underscores allowed, and must not start with a digit.`);
+        }
+      }
+    }
+
+    // 4. Compose validation result
+    let messages = [];
+    if (unsupportedSymbols && unsupportedSymbols.length > 0) {
+      messages.push(`Unsupported symbols found: ${Array.from(new Set(unsupportedSymbols)).join(' ')}`);
+    }
+    if (datatypeErrors.length > 0) {
+      messages = messages.concat(datatypeErrors);
+    }
+    if (creationErrors.length > 0) {
+      messages = messages.concat(creationErrors);
+    }
+    if (messages.length === 0) {
+      messages.push("Script is valid: no unsupported symbols or datatypes detected.");
+      setValidationResult({ valid: true, message: messages.join(' ') });
+    } else {
+      setValidationResult({ valid: false, message: messages.join(' | ') });
+    }
+  };
   // ...existing state and handlers...
 
   const handleDownload = () => {
@@ -270,7 +422,35 @@ const handleColumnChange = (idx, field, value) => {
 
   return (
     <div className="dbg-container">
-      <h2 className="dbg-title">DB Script Generator</h2>
+      {/* Common Header */}
+      <div style={{display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: 12, gap: 12}}>
+        <img src="/db.svg" alt="Database" style={{height: 40, width: 40, margin: 0, display: 'block'}} />
+        <h1 className="dbg-title" style={{fontSize: '2.3rem', margin: 0, lineHeight: 1}}>Query Supporting Tool</h1>
+      </div>
+      <hr style={{border: 0, borderTop: '2px solid #e2e8f0', margin: '0 0 24px 0'}} />
+      {/* Tab Navigation */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 28 }}>
+        <button
+          data-testid="tab-generator"
+          className="dbg-btn"
+          style={{ background: activeTab === 'generator' ? '#3182ce' : '#f1f5f9', color: activeTab === 'generator' ? '#fff' : '#374151' }}
+          onClick={() => setActiveTab('generator')}
+        >
+          DB Script Generator
+        </button>
+        <button
+          data-testid="tab-validator"
+          className="dbg-btn"
+          style={{ background: activeTab === 'validator' ? '#3182ce' : '#f1f5f9', color: activeTab === 'validator' ? '#fff' : '#374151' }}
+          onClick={() => setActiveTab('validator')}
+        >
+          Script Validator
+        </button>
+      </div>
+      {/* Tab Panels */}
+      {activeTab === 'generator' && (
+        <div>
+          <h2 className="dbg-title">DB Script Generator</h2>
       <label className="dbg-label">Database System: </label>
       <select className="dbg-select" value={dbSystem} onChange={e => { setDbSystem(e.target.value); setColumns([{ name: "id", type: sqlTypes[e.target.value][0], nullable: false, primary: true }]); }}>
         {dbSystems.map(opt => (
@@ -278,11 +458,11 @@ const handleColumnChange = (idx, field, value) => {
         ))}
       </select>
       <br /><br />
-      <label className="dbg-label">Database Name: </label>
-      <input className="dbg-input" value={dbName} onChange={e => setDbName(e.target.value)} />
+      <label className="dbg-label" htmlFor="dbName">Database Name: </label>
+      <input id="dbName" className="dbg-input" value={dbName} onChange={e => setDbName(e.target.value)} />
       <br /><br />
-      <label className="dbg-label">Table Name: </label>
-      <input className="dbg-input" value={tableName} onChange={e => setTableName(e.target.value)} />
+      <label className="dbg-label" htmlFor="tableName">Table Name: </label>
+      <input id="tableName" className="dbg-input" value={tableName} onChange={e => setTableName(e.target.value)} />
       <br /><br />
       <h4 className="dbg-label" style={{fontSize:'1.15rem', marginBottom:8}}>Columns</h4>
       {colNameError && (
@@ -320,7 +500,29 @@ const handleColumnChange = (idx, field, value) => {
       <button className="dbg-btn" onClick={() => setScript("")}>Remove Script</button>
       <button className="dbg-btn" onClick={handleDownload} disabled={!script}>Download Script</button>
       <br /><br />
-      <textarea className="dbg-textarea" value={script} readOnly rows={15} />
+      <textarea className="dbg-textarea" value={script} readOnly rows={15} data-testid="output-script" />
+        </div>
+      )}
+      {activeTab === 'validator' && (
+        <div>
+          <h2 className="dbg-title">Script Validator</h2>
+          <textarea
+            className="dbg-textarea"
+            value={validatorScript}
+            onChange={e => setValidatorScript(e.target.value)}
+            placeholder="Paste your SQL script here..."
+            rows={12}
+          />
+          <br />
+          <button className="dbg-btn" onClick={handleValidateScript}>Validate</button>
+          <br />
+          {validationResult && (
+            <div style={{ marginTop: 16, color: validationResult.valid ? 'green' : 'red', fontWeight: 500 }}>
+              {validationResult.message}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
